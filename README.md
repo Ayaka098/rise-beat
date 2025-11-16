@@ -1,36 +1,175 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+↓このまま Codex に貼れる指示文です ✨
 
-## Getting Started
+---
 
-First, run the development server:
+Next.js を使って、PCブラウザで動くシングルページ Web アプリ **「Rise Beat」** を実装してください。
+ユーザー登録やバックエンドは不要で、すべてブラウザ内（localStorage）で完結させてください。
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+---
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## ■ 概要
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+* アプリ名：**Rise Beat**
+* 目的：
+  朝起きたくないときに、ユーザーが用意した動画・音声のプレイリストをアラームとして流すことで、
+  好きな音楽に合わせて歌ったり踊ったりしながら布団から出て、タスクに取り掛かりたくなるようにする。
+* 特徴：
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+  * PCブラウザで動作（Next.js）
+  * ローカルの動画/音声ファイルを読み込んでプレイリストを作り、それをアラームとして再生する
+  * アラームは **常に1つだけ** を管理する（複数同時アラームは不要）
 
-## Learn More
+---
 
-To learn more about Next.js, take a look at the following resources:
+## ■ 技術スタック
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+* フレームワーク：**Next.js**（最新版でOK、App Router / pages どちらでもよい）
+* 言語：TypeScript が望ましい（難しければ JavaScript でも可）
+* スタイル：シンプルな見た目でよい（Tailwind でも通常の CSS でもどちらでもよい）
+* データ永続化：ブラウザの **localStorage** を使用
+* バックエンドや DB サーバーは使わない
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+---
 
-## Deploy on Vercel
+## ■ 画面構成（1ページ内で完結でOK）
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. **動画・音声ファイル管理セクション**
+2. **プレイリスト作成・編集セクション**
+3. **アラーム設定セクション**
+4. **現在のアラーム表示＆停止セクション**
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+これらを `app/page.tsx` もしくは `pages/index.tsx` 内のコンポーネントとして実装してください。
+
+---
+
+## ■ 機能詳細
+
+### 1. 動画・音声ファイル管理
+
+* `<input type="file" multiple>` を使って、ユーザーが PC 上の
+  **動画ファイル / 音声ファイル** を複数選択してインポートできるようにする。
+* 対応フォーマットはブラウザが再生できる一般的なもの（mp4, webm, mp3, etc）でよい。
+* 選択したファイルはブラウザ上で管理し、以下の情報を保持する：
+
+  * 一意なID
+  * ファイル名（タイトルとして表示）
+  * MIMEタイプ（`video/*` か `audio/*` か判別できればOK）
+  * `URL.createObjectURL(file)` で生成した一時URL
+* インポート済みのファイル一覧を表示する（タイトルと種別だけでよい）。
+* このファイル情報を **localStorage** に保存し、ページ再読み込み後も復元できるようにする。
+
+※ファイルそのものを localStorage に保存する必要はなく、
+ID・ファイル名・種別等のメタ情報だけを保存すればよい。
+新規読み込み時はそのセッション内でのみ再生できれば十分。
+
+---
+
+### 2. プレイリスト機能
+
+* インポート済みのファイル一覧から、複数の動画/音声を選択し、
+  **プレイリスト** を作成できるようにする。
+* プレイリストには以下の情報を持たせる：
+
+  * プレイリストID
+  * プレイリスト名（ユーザーが入力）
+  * 含まれるファイルIDの配列（再生順）
+* UI要件：
+
+  * プレイリスト名の入力欄
+  * ファイル一覧のチェックボックスまたは追加ボタン
+  * 「プレイリストを保存」ボタン
+  * 既存プレイリスト一覧（名前を表示）
+  * プレイリスト編集：
+
+    * 含まれるファイルの順番を上下ボタンなどで並べ替え可能にする
+    * プレイリストからファイルを削除できる
+  * プレイリスト削除ボタン（削除前に「本当に削除しますか？」などの確認を出す）
+* プレイリスト情報も localStorage に保存し、再読み込み後も復元されるようにする。
+
+---
+
+### 3. アラーム設定（常に1つだけ）
+
+* アラームは **1つだけ** 管理する。複数同時アラームは不要。
+* アラームが持つ情報：
+
+  * アラーム時刻（`<input type="time">` で指定）
+  * 使用するプレイリストID
+  * タスクメモ（テキストエリア。複数行OK）
+  * アラームON/OFFフラグ
+* アラーム設定セクションに以下を用意する：
+
+  * 「時刻」入力（24時間表記）
+  * 「プレイリスト選択」のプルダウン
+  * 「タスクメモ」入力（後述の条件あり）
+  * 「アラームをONにする / OFFにする」ボタン or トグル
+* タスクメモについて：
+
+  * アラームのON/OFFや時刻・プレイリストを変更しても、
+    **タスクメモの内容は保持される** ようにする（毎朝共通のタスクを書くイメージ）。
+  * ページ再読み込み後も localStorage から復元する。
+* アラームのスケジューリング：
+
+  * アラームをONにしたタイミングで、現在時刻との差を計算し `setTimeout` で予約する。
+  * ページ読み込み時には localStorage からアラーム設定を読み込み、
+    まだ未来の時刻なら再度 `setTimeout` を登録し直す。
+  * 24時間以内のアラームを想定し、簡易的な実装でよい
+    （例えば、アラーム時刻が現在より前なら「次の日の同じ時刻」として扱う、など）。
+
+※ブラウザを閉じていたり、PCがスリープ中のときはアラームが動かないことは許容してよい。
+　あくまで「Rise Beat を開いておいて使う」想定で構わない。
+
+---
+
+### 4. アラーム発火時の動作とUI
+
+* アラーム時刻になると、指定されたプレイリストを **最初の要素から順番に自動再生** する。
+* 再生方法：
+
+  * 再生中の要素として、動画の場合は `<video>`、音声の場合は `<audio>` を使う。
+  * 再生が終わったら `ended` イベントを拾い、プレイリスト内の次のファイルに自動で切り替えて再生を続ける。
+  * プレイリストの最後まで到達したら自動再生を終了する。
+* UI：
+
+  * 再生セクションには現在再生中のファイル名を表示する。
+  * 再生中にユーザーが押せるボタンは **「止める（停止）」ボタンのみ** とする。
+    一時停止（pause）ボタンは **実装しない**。
+  * 「止める」ボタンを押されたら：
+
+    * 現在の `<video>` / `<audio>` の再生を停止し、先頭に戻すか、プレイリスト再生状態をリセットする。
+    * アラーム発火中であれば、それ以上の自動再生は行わない。
+
+---
+
+### 5. 現在のアラーム表示
+
+* 画面の見やすい位置に「現在のアラーム設定」をまとめて表示する。
+
+  * 例：
+
+    * 次のアラーム：07:00
+    * プレイリスト：朝テンション爆上げ
+    * タスク：
+
+      * 服を選ぶ
+      * 水筒とハンカチを準備
+* この表示はアラームがONのときだけでよい。OFFなら「アラームはOFFです」と表示してもよい。
+
+---
+
+## ■ デザイン
+
+* シンプルで構わないが、以下のようなまとまりがあると使いやすい：
+
+  * セクションごとにカード風に分ける（ファイル管理 / プレイリスト / アラーム設定 / 現在のアラーム）
+  * ボタンや入力欄のラベルは、ユーザーにとって意味が分かる日本語で表示する
+* レスポンシブ対応は必須ではない（PCブラウザ前提でOK）。
+
+---
+
+## ■ その他
+
+* コードは読みやすく、適度にコンポーネント分割してください。
+* コメントで要所（localStorageのキー名や、アラーム発火処理など）を簡単に説明してください。
+
+以上の仕様に従って、Next.js プロジェクト全体（必要なページとコンポーネント、スタイルを含む）を実装してください。

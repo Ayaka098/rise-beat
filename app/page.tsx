@@ -1,6 +1,7 @@
 "use client";
 
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, KeyboardEvent } from "react";
 
 type MediaKind = "audio" | "video";
 
@@ -9,7 +10,9 @@ type MediaFile = {
   name: string;
   mimeType: string;
   kind: MediaKind;
-  createdAt: number;
+  createdAt: string;
+  durationSec?: number;
+  hasBlob?: boolean;
 };
 
 type Playlist = {
@@ -23,783 +26,1006 @@ type AlarmSetting = {
   playlistId: string | null;
   memo: string;
   isOn: boolean;
-  nextTrigger: number | null;
+  nextTrigger?: string;
 };
 
 const MEDIA_KEY = "riseBeat_media";
 const PLAYLIST_KEY = "riseBeat_playlists";
 const ALARM_KEY = "riseBeat_alarm";
 
-const initialAlarm: AlarmSetting = {
-  time: "",
+const DB_NAME = "riseBeatMediaStore";
+const DB_VERSION = 1;
+const STORE_NAME = "files";
+
+const DEFAULT_ALARM: AlarmSetting = {
+  time: "07:00",
   playlistId: null,
   memo: "",
   isOn: false,
-  nextTrigger: null,
 };
 
-const cardClass =
-  "rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm";
-const sectionTitleClass = "text-xl font-semibold text-zinc-900";
+let mediaDbPromise: Promise<IDBDatabase | null> | null = null;
+
+const isBrowser = () => typeof window !== "undefined";
+
+function safeRead<T>(key: string): T | null {
+  if (!isBrowser()) return null;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    console.warn(`Failed to parse ${key}`, error);
+    return null;
+  }
+}
+
+function formatDuration(seconds?: number | null) {
+  if (!seconds || seconds <= 0) return "--:--";
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  if (hrs > 0) {
+    return `${hrs}:${mins.toString().padStart(2, "0")}:${secs
+      .toString()
+      .padStart(2, "0")}`;
+  }
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function formatClock(date: Date) {
+  return `${date.getHours().toString().padStart(2, "0")}:${date
+    .getMinutes()
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function formatRemaining(seconds: number) {
+  const positive = Math.max(seconds, 0);
+  const mins = Math.floor(positive / 60);
+  const secs = Math.floor(positive % 60);
+  return `${mins}分${secs.toString().padStart(2, "0")}秒`;
+}
+
+async function openMediaDb() {
+  if (!isBrowser()) return null;
+  if (mediaDbPromise) return mediaDbPromise;
+  mediaDbPromise = new Promise((resolve) => {
+    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+    request.onsuccess = () => {
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      console.error("indexedDB open failed", request.error);
+      resolve(null);
+    };
+  });
+  return mediaDbPromise;
+}
+
+async function storeBlob(id: string, file: Blob) {
+  const db = await openMediaDb();
+  if (!db) return;
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.objectStore(STORE_NAME).put(file, id);
+  });
+}
+
+async function readBlob(id: string) {
+  const db = await openMediaDb();
+  if (!db) return null;
+  return new Promise<Blob | null>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const request = tx.objectStore(STORE_NAME).get(id);
+    request.onsuccess = () => {
+      resolve(request.result ?? null);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function removeBlob(id: string) {
+  const db = await openMediaDb();
+  if (!db) return;
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.objectStore(STORE_NAME).delete(id);
+  });
+}
+
+async function readMediaDuration(blob: Blob, kind: MediaKind) {
+  if (!isBrowser()) return undefined;
+  return new Promise<number | undefined>((resolve) => {
+    const element = document.createElement(kind === "video" ? "video" : "audio");
+    element.preload = "metadata";
+    const url = URL.createObjectURL(blob);
+    element.src = url;
+    element.onloadedmetadata = () => {
+      URL.revokeObjectURL(url);
+      if (element.duration && Number.isFinite(element.duration)) {
+        resolve(Math.round(element.duration));
+      } else {
+        resolve(undefined);
+      }
+    };
+    element.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(undefined);
+    };
+  });
+}
+
+function calculateNextTrigger(time: string) {
+  if (!time || !/^\d{2}:\d{2}$/.test(time)) return null;
+  const [hour, minute] = time.split(":").map(Number);
+  const now = new Date();
+  const candidate = new Date();
+  candidate.setHours(hour, minute, 0, 0);
+  if (candidate.getTime() <= now.getTime()) {
+    candidate.setDate(candidate.getDate() + 1);
+  }
+  return candidate;
+}
+
+function playlistDurationSec(playlist: Playlist, files: MediaFile[]) {
+  const lookup = new Map(files.map((file) => [file.id, file]));
+  return playlist.fileIds.reduce((acc, id) => {
+    const file = lookup.get(id);
+    return acc + (file?.durationSec ?? 0);
+  }, 0);
+}
 
 export default function Home() {
-  const [hydrated, setHydrated] = useState(false);
+  const [ready, setReady] = useState(false);
   const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
-  const [alarm, setAlarm] = useState<AlarmSetting>(initialAlarm);
-  const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
-  const [playlistDraftName, setPlaylistDraftName] = useState("");
-  const [playlistDraftFileIds, setPlaylistDraftFileIds] = useState<string[]>([]);
-  const [isAlarmRinging, setIsAlarmRinging] = useState(false);
-  const [playbackState, setPlaybackState] = useState<{ playlistId: string; index: number } | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [alarm, setAlarm] = useState<AlarmSetting>(DEFAULT_ALARM);
+  const [editingPlaylist, setEditingPlaylist] = useState<Playlist | null>(null);
+  const [unpersistedId, setUnpersistedId] = useState<string | null>(null);
   const [needsManualPlay, setNeedsManualPlay] = useState(false);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sessionUrls = useRef<Record<string, string>>({});
-  const mediaElementRef = useRef<HTMLMediaElement | null>(null);
+  const [playbackPlaylistId, setPlaybackPlaylistId] = useState<string | null>(null);
+  const [currentTrackIndex, setCurrentTrackIndex] = useState(0);
+  const [currentTrackUrl, setCurrentTrackUrl] = useState<string | null>(null);
+  const [playbackMessage, setPlaybackMessage] = useState<string>("待機中");
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [missingObjectUrl, setMissingObjectUrl] = useState(false);
+  const sessionUrls = useRef(new Map<string, string>());
+  const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
+  const alarmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const processedDurations = useRef(new Set<string>());
+  const [progressSnapshot, setProgressSnapshot] = useState({ remaining: 0, percent: 0 });
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
 
-  // Load persisted data once
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    try {
-      const savedMedia = localStorage.getItem(MEDIA_KEY);
-      const savedPlaylists = localStorage.getItem(PLAYLIST_KEY);
-      const savedAlarm = localStorage.getItem(ALARM_KEY);
-
-      if (savedMedia) {
-        const parsed: MediaFile[] = JSON.parse(savedMedia);
-        setMediaFiles(parsed);
+    if (!isBrowser()) return;
+    const storedMedia = safeRead<MediaFile[]>(MEDIA_KEY) ?? [];
+    const normalizedMedia = storedMedia.map((file) => ({
+      ...file,
+      hasBlob: file.hasBlob ?? false,
+    }));
+    setMediaFiles(normalizedMedia);
+    const storedPlaylists = safeRead<Playlist[]>(PLAYLIST_KEY) ?? [];
+    setPlaylists(storedPlaylists);
+    const storedAlarm = safeRead<AlarmSetting>(ALARM_KEY);
+    const mergedAlarm: AlarmSetting = { ...DEFAULT_ALARM, ...(storedAlarm ?? {}) };
+    if (mergedAlarm.playlistId) {
+      const target = storedPlaylists.find((playlist) => playlist.id === mergedAlarm.playlistId);
+      if (!target || target.fileIds.length === 0) {
+        mergedAlarm.playlistId = null;
+        mergedAlarm.isOn = false;
+        mergedAlarm.nextTrigger = undefined;
       }
-      if (savedPlaylists) {
-        const parsed: Playlist[] = JSON.parse(savedPlaylists);
-        setPlaylists(parsed);
-      }
-      if (savedAlarm) {
-        const parsed: AlarmSetting = JSON.parse(savedAlarm);
-        setAlarm(parsed);
-      }
-    } catch (error) {
-      console.error("Failed to load Rise Beat data", error);
-    } finally {
-      setHydrated(true);
     }
+    setAlarm(mergedAlarm);
+    setReady(true);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
-  // Persist media list
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(MEDIA_KEY, JSON.stringify(mediaFiles));
-  }, [mediaFiles, hydrated]);
+    if (!ready || !isBrowser()) return;
+    window.localStorage.setItem(MEDIA_KEY, JSON.stringify(mediaFiles));
+  }, [mediaFiles, ready]);
 
-  // Persist playlists
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(PLAYLIST_KEY, JSON.stringify(playlists));
-  }, [playlists, hydrated]);
+    if (!ready || !isBrowser()) return;
+    window.localStorage.setItem(PLAYLIST_KEY, JSON.stringify(playlists));
+  }, [playlists, ready]);
 
-  // Persist alarm settings
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(ALARM_KEY, JSON.stringify(alarm));
-  }, [alarm, hydrated]);
+    if (!ready || !isBrowser()) return;
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify(alarm));
+  }, [alarm, ready]);
 
-  const clearAlarmTimeout = useCallback(() => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-  }, []);
-
-  const computeNextTrigger = useCallback((time: string) => {
-    const [hours, minutes] = time.split(":").map((value) => parseInt(value, 10));
-    const now = new Date();
-    const target = new Date();
-    target.setHours(hours, minutes, 0, 0);
-    if (target.getTime() <= now.getTime()) {
-      target.setDate(target.getDate() + 1);
-    }
-    return target.getTime();
-  }, []);
-
-  const beginPlayback = useCallback(
-    (playlistId: string) => {
-      const playlist = playlists.find((item) => item.id === playlistId);
-      if (!playlist || playlist.fileIds.length === 0) {
-        setStatusMessage("再生できるファイルが見つかりません。");
-        return;
-      }
-      setStatusMessage(null);
-      setIsAlarmRinging(true);
-      setPlaybackState({ playlistId, index: 0 });
-      setNeedsManualPlay(false);
-    },
-    [playlists],
-  );
-
-  const stopPlayback = useCallback(() => {
-    if (mediaElementRef.current) {
-      mediaElementRef.current.pause();
-      mediaElementRef.current.currentTime = 0;
-    }
-    mediaElementRef.current = null;
-    setIsAlarmRinging(false);
-    setPlaybackState(null);
-    setNeedsManualPlay(false);
-  }, []);
-
-  const finishPlayback = useCallback(() => {
-    stopPlayback();
-    setStatusMessage("プレイリストの再生が完了しました。");
-    if (alarm.isOn && alarm.time) {
-      const next = computeNextTrigger(alarm.time);
-      setAlarm((prev) => ({ ...prev, nextTrigger: next }));
-    }
-  }, [alarm.isOn, alarm.time, computeNextTrigger, stopPlayback]);
-
-  const advanceTrack = useCallback(
-    (nextIndex?: number) => {
-      setPlaybackState((prev) => {
-        if (!prev) return null;
-        const playlist = playlists.find((p) => p.id === prev.playlistId);
-        if (!playlist) {
-          return null;
-        }
-        const targetIndex = typeof nextIndex === "number" ? nextIndex : prev.index + 1;
-        if (targetIndex >= playlist.fileIds.length) {
-          finishPlayback();
-          return null;
-        }
-        return { ...prev, index: targetIndex };
-      });
-    },
-    [finishPlayback, playlists],
-  );
-
-  // Schedule alarm firing based on current alarm settings
   useEffect(() => {
-    if (!hydrated) return;
-    clearAlarmTimeout();
-
-    if (!alarm.isOn || !alarm.time || !alarm.playlistId) {
-      if (alarm.nextTrigger) {
-        setAlarm((prev) => ({ ...prev, nextTrigger: null }));
-      }
-      return;
-    }
-
-    const now = Date.now();
-    const existing = alarm.nextTrigger;
-    const nextTarget =
-      existing && existing > now ? existing : computeNextTrigger(alarm.time);
-
-    if (nextTarget !== existing) {
-      setAlarm((prev) => ({ ...prev, nextTrigger: nextTarget }));
-      return;
-    }
-
-    const delay = Math.max(nextTarget - now, 0);
-    timeoutRef.current = setTimeout(() => {
-      beginPlayback(alarm.playlistId!);
-      setAlarm((prev) => {
-        if (!prev.isOn || !prev.time) {
-          return { ...prev, nextTrigger: null };
-        }
-        const next = computeNextTrigger(prev.time);
-        return { ...prev, nextTrigger: next };
-      });
-    }, delay);
-
+    const cache = sessionUrls.current;
     return () => {
-      clearAlarmTimeout();
+      cache.forEach((url) => URL.revokeObjectURL(url));
+      cache.clear();
     };
-  }, [
-    alarm.isOn,
-    alarm.nextTrigger,
-    alarm.playlistId,
-    alarm.time,
-    beginPlayback,
-    clearAlarmTimeout,
-    computeNextTrigger,
-    hydrated,
-  ]);
+  }, []);
 
-  // Cleanup object URLs on unmount
-  useEffect(
-    () => () => {
-      Object.values(sessionUrls.current).forEach((url) => URL.revokeObjectURL(url));
+  const detachAlarmTimeout = useCallback(() => {
+    if (alarmTimeoutRef.current) {
+      clearTimeout(alarmTimeoutRef.current);
+      alarmTimeoutRef.current = null;
+    }
+  }, []);
+
+  const ensureDuration = useCallback(
+    async (file: MediaFile) => {
+      if (processedDurations.current.has(file.id)) return;
+      if (!file.hasBlob || file.durationSec) return;
+      const blob = await readBlob(file.id);
+      if (!blob) return;
+      const durationSec = await readMediaDuration(blob, file.kind);
+      if (durationSec) {
+        processedDurations.current.add(file.id);
+        setMediaFiles((prev) =>
+          prev.map((entry) => (entry.id === file.id ? { ...entry, durationSec } : entry)),
+        );
+      }
     },
     [],
   );
 
-  // Ensure alarm references valid playlist data
   useEffect(() => {
-    if (!hydrated || !alarm.playlistId) return;
-    const target = playlists.find((playlist) => playlist.id === alarm.playlistId);
-    if (!target || target.fileIds.length === 0) {
-      setAlarm((prev) => {
-        if (prev.playlistId !== alarm.playlistId) {
-          return prev;
-        }
-        return { ...prev, playlistId: null, isOn: false, nextTrigger: null };
-      });
-      clearAlarmTimeout();
-      stopPlayback();
-    }
-  }, [alarm.playlistId, clearAlarmTimeout, hydrated, playlists, stopPlayback]);
-
-  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
-
-    const additions: MediaFile[] = [];
-    Array.from(files).forEach((file) => {
-      const mime = file.type;
-      const kind: MediaKind = mime.startsWith("video") ? "video" : "audio";
-      if (kind === "audio" || kind === "video") {
-        const id = crypto.randomUUID();
-        additions.push({
-          id,
-          name: file.name,
-          mimeType: mime,
-          kind,
-          createdAt: Date.now(),
-        });
-        sessionUrls.current[id] = URL.createObjectURL(file);
+    mediaFiles.forEach((file) => {
+      if (!file.durationSec && file.hasBlob) {
+        void ensureDuration(file);
       }
     });
+  }, [mediaFiles, ensureDuration]);
 
-    if (additions.length) {
-      setMediaFiles((prev) => [...prev, ...additions]);
-      setStatusMessage(`${additions.length}件のファイルを読み込みました。`);
-    } else {
-      setStatusMessage("動画または音声のファイルのみ追加できます。");
+  const playlistTotalDuration = useMemo(() => {
+    if (!editingPlaylist) return 0;
+    return playlistDurationSec(editingPlaylist, mediaFiles);
+  }, [editingPlaylist, mediaFiles]);
+
+  const loadTrackUrl = useCallback(
+    async (fileId: string) => {
+      if (!fileId) return null;
+      if (sessionUrls.current.has(fileId)) {
+        return sessionUrls.current.get(fileId) ?? null;
+      }
+      const blob = await readBlob(fileId);
+      if (!blob) return null;
+      const url = URL.createObjectURL(blob);
+      sessionUrls.current.set(fileId, url);
+      return url;
+    },
+    [],
+  );
+
+  const currentTrack = useMemo(() => {
+    if (!playbackPlaylistId) return null;
+    const playlist = playlists.find((p) => p.id === playbackPlaylistId);
+    if (!playlist) return null;
+    const mediaId = playlist.fileIds[currentTrackIndex];
+    if (!mediaId) return null;
+    return mediaFiles.find((file) => file.id === mediaId) ?? null;
+  }, [playbackPlaylistId, playlists, currentTrackIndex, mediaFiles]);
+
+  const startPlayback = useCallback(
+    (playlistId: string, fromAlarm = false) => {
+      const playlist = playlists.find((p) => p.id === playlistId);
+      if (!playlist || playlist.fileIds.length === 0) {
+        setPlaybackMessage("再生できるトラックがありません");
+        setPlaybackPlaylistId(null);
+        setIsPlaying(false);
+        return;
+      }
+      setPlaybackPlaylistId(playlistId);
+      setCurrentTrackIndex(0);
+      setIsPlaying(true);
+      setNeedsManualPlay(false);
+      setPlaybackMessage(fromAlarm ? "アラームから再生を開始しました" : "再生を開始しました");
+    },
+    [playlists],
+  );
+
+  useEffect(() => {
+    detachAlarmTimeout();
+    if (!alarm.isOn || !alarm.nextTrigger || !alarm.playlistId) return;
+    const target = new Date(alarm.nextTrigger).getTime();
+    const delay = Math.max(target - Date.now(), 0);
+    alarmTimeoutRef.current = setTimeout(() => {
+      startPlayback(alarm.playlistId, true);
+      const next = calculateNextTrigger(alarm.time);
+      setAlarm((prev) => ({
+        ...prev,
+        nextTrigger: next?.toISOString(),
+      }));
+    }, delay);
+    return () => detachAlarmTimeout();
+  }, [alarm, detachAlarmTimeout, startPlayback]);
+
+  const stopPlayback = useCallback(() => {
+    setIsPlaying(false);
+    setPlaybackPlaylistId(null);
+    setCurrentTrackIndex(0);
+    setCurrentTrackUrl(null);
+    setNeedsManualPlay(false);
+    setMissingObjectUrl(false);
+    if (mediaElementRef.current) {
+      mediaElementRef.current.pause();
+      mediaElementRef.current.currentTime = 0;
     }
+    setProgressSnapshot({ remaining: 0, percent: 0 });
+  }, []);
+
+  const advanceTrack = useCallback(
+    (reason?: string) => {
+      if (!playbackPlaylistId) return;
+      const playlist = playlists.find((p) => p.id === playbackPlaylistId);
+      if (!playlist) {
+        stopPlayback();
+        return;
+      }
+      if (reason) {
+        setPlaybackMessage(reason);
+      }
+      if (currentTrackIndex + 1 < playlist.fileIds.length) {
+        setCurrentTrackIndex((index) => index + 1);
+      } else {
+        setPlaybackMessage("プレイリストを再生し終えました");
+        stopPlayback();
+      }
+    },
+    [playbackPlaylistId, playlists, currentTrackIndex, stopPlayback],
+  );
+
+  const attemptPlay = useCallback(async () => {
+    if (!mediaElementRef.current) return;
+    try {
+      await mediaElementRef.current.play();
+      setNeedsManualPlay(false);
+      setPlaybackMessage("再生中");
+    } catch {
+      setNeedsManualPlay(true);
+      setPlaybackMessage("自動再生できません。ボタンで開始してください");
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const setup = async () => {
+      if (!currentTrack) {
+        setCurrentTrackUrl(null);
+        setMissingObjectUrl(false);
+        return;
+      }
+      const url = await loadTrackUrl(currentTrack.id);
+      if (cancelled) return;
+      if (!url) {
+        setMissingObjectUrl(true);
+        advanceTrack();
+        return;
+      }
+      setMissingObjectUrl(false);
+      setCurrentTrackUrl(url);
+    };
+    void setup();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack, loadTrackUrl, advanceTrack]);
+
+  const handleManualPlay = () => {
+    void attemptPlay();
+  };
+
+  const handleEnterFullscreen = () => {
+    const element = mediaElementRef.current;
+    if (element instanceof HTMLVideoElement && element.requestFullscreen) {
+      element.requestFullscreen().catch(() => {
+        // ignore
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!isPlaying || !currentTrack || !playbackPlaylistId) return;
+    const interval = setInterval(() => {
+      const playlist = playlists.find((p) => p.id === playbackPlaylistId);
+      if (!playlist) return;
+      const total = playlistDurationSec(playlist, mediaFiles);
+      const completed = playlist.fileIds
+        .slice(0, currentTrackIndex)
+        .reduce((acc, id) => {
+          const file = mediaFiles.find((entry) => entry.id === id);
+          return acc + (file?.durationSec ?? 0);
+        }, 0);
+      const currentTime = mediaElementRef.current?.currentTime ?? 0;
+      const played = completed + currentTime;
+      const percent = total > 0 ? Math.min(100, Math.round((played / total) * 100)) : 0;
+      const remaining = Math.max(total - played, 0);
+      setProgressSnapshot({ remaining, percent });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isPlaying, currentTrack, playlists, playbackPlaylistId, mediaFiles, currentTrackIndex]);
+
+  const editingPlaylistDuration = formatDuration(playlistTotalDuration);
+  const editingPlaylistIsSaved = useMemo(
+    () => (editingPlaylist ? playlists.some((playlist) => playlist.id === editingPlaylist.id) : false),
+    [editingPlaylist, playlists],
+  );
+
+  const alarmPlaylist = useMemo(() => playlists.find((p) => p.id === alarm.playlistId) ?? null, [playlists, alarm.playlistId]);
+
+  const alarmPlaylistDurationSec = useMemo(() => (alarmPlaylist ? playlistDurationSec(alarmPlaylist, mediaFiles) : 0), [alarmPlaylist, mediaFiles]);
+
+  const plannedStartDate = useMemo(() => {
+    if (alarm.isOn && alarm.nextTrigger) return new Date(alarm.nextTrigger);
+    return calculateNextTrigger(alarm.time);
+  }, [alarm]);
+
+  const plannedEndDate = useMemo(() => {
+    if (!plannedStartDate || !alarmPlaylistDurationSec) return null;
+    return new Date(plannedStartDate.getTime() + alarmPlaylistDurationSec * 1000);
+  }, [plannedStartDate, alarmPlaylistDurationSec]);
+
+  const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files) return;
+    const additions: MediaFile[] = [];
+    for (const file of Array.from(files)) {
+      const id = crypto.randomUUID();
+      const kind: MediaKind = file.type.startsWith("video") ? "video" : "audio";
+      await storeBlob(id, file);
+      const durationSec = await readMediaDuration(file, kind);
+      additions.push({
+        id,
+        name: file.name,
+        mimeType: file.type || (kind === "video" ? "video/mp4" : "audio/mpeg"),
+        kind,
+        createdAt: new Date().toISOString(),
+        durationSec,
+        hasBlob: true,
+      });
+    }
+    setMediaFiles((prev) => [...prev, ...additions]);
     event.target.value = "";
   };
 
-  const handleRemoveMedia = (id: string) => {
+  const handleRemoveMedia = async (id: string) => {
+    const alarmPlaylistId = alarm.playlistId;
+    setPlaylists((prev) => {
+      const updated = prev.map((playlist) => ({
+        ...playlist,
+        fileIds: playlist.fileIds.filter((fileId) => fileId !== id),
+      }));
+      if (alarmPlaylistId) {
+        const target = updated.find((playlist) => playlist.id === alarmPlaylistId);
+        if (!target || target.fileIds.length === 0) {
+          setAlarm((prevAlarm) => ({
+            ...prevAlarm,
+            playlistId: target ? prevAlarm.playlistId : null,
+            isOn: false,
+            nextTrigger: undefined,
+          }));
+        }
+      }
+      return updated;
+    });
     setMediaFiles((prev) => prev.filter((file) => file.id !== id));
-    if (sessionUrls.current[id]) {
-      URL.revokeObjectURL(sessionUrls.current[id]);
-      delete sessionUrls.current[id];
-    }
-    let alarmPlaylistCleared = false;
-    setPlaylists((prev) =>
-      prev.map((playlist) => {
-        if (!playlist.fileIds.includes(id)) {
-          return playlist;
-        }
-        const nextFileIds = playlist.fileIds.filter((fileId) => fileId !== id);
-        if (playlist.id === alarm.playlistId && nextFileIds.length === 0) {
-          alarmPlaylistCleared = true;
-        }
-        return { ...playlist, fileIds: nextFileIds };
-      }),
+    setEditingPlaylist((prev) =>
+      prev ? { ...prev, fileIds: prev.fileIds.filter((fileId) => fileId !== id) } : prev,
     );
-    setPlaylistDraftFileIds((prev) => prev.filter((fileId) => fileId !== id));
-    if (alarmPlaylistCleared) {
-      setAlarm((prev) => ({ ...prev, playlistId: null, isOn: false, nextTrigger: null }));
-      clearAlarmTimeout();
-      stopPlayback();
+    setNameDrafts((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    const url = sessionUrls.current.get(id);
+    if (url) {
+      URL.revokeObjectURL(url);
+      sessionUrls.current.delete(id);
     }
-    setStatusMessage("ファイルを削除しました。");
+    await removeBlob(id);
   };
 
-  const handleSelectPlaylist = (playlistId: string | null) => {
-    if (!playlistId) {
-      setSelectedPlaylistId(null);
-      setPlaylistDraftName("");
-      setPlaylistDraftFileIds([]);
-      return;
-    }
-    const target = playlists.find((playlist) => playlist.id === playlistId);
-    if (!target) return;
-    setSelectedPlaylistId(playlistId);
-    setPlaylistDraftName(target.name);
-    setPlaylistDraftFileIds([...target.fileIds]);
+  const updateNameDraft = (id: string, value: string) => {
+    setNameDrafts((prev) => ({ ...prev, [id]: value }));
   };
 
-  const handleAddFileToDraft = (fileId: string) => {
-    if (!fileId) return;
-    const exists = mediaFiles.some((file) => file.id === fileId);
-    if (!exists) return;
-    setPlaylistDraftFileIds((prev) => [...prev, fileId]);
-  };
-
-  const moveDraftItem = (index: number, direction: -1 | 1) => {
-    setPlaylistDraftFileIds((prev) => {
-      const next = [...prev];
-      const targetIndex = index + direction;
-      if (targetIndex < 0 || targetIndex >= next.length) return prev;
-      const [item] = next.splice(index, 1);
-      next.splice(targetIndex, 0, item);
+  const clearNameDraft = (id: string) => {
+    setNameDrafts((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
       return next;
     });
   };
 
-  const removeDraftItem = (index: number) => {
-    setPlaylistDraftFileIds((prev) => prev.filter((_, idx) => idx !== index));
+  const handleNameCommit = (id: string) => {
+    const draft = nameDrafts[id];
+    const trimmed = (draft ?? "").trim();
+    if (!draft || !trimmed) {
+      clearNameDraft(id);
+      return;
+    }
+    setMediaFiles((prev) =>
+      prev.map((file) => (file.id === id ? { ...file, name: trimmed } : file)),
+    );
+    clearNameDraft(id);
   };
 
-  const handleSavePlaylist = () => {
-    if (!playlistDraftName.trim()) {
-      setStatusMessage("プレイリスト名を入力してください。");
-      return;
-    }
-    if (playlistDraftFileIds.length === 0) {
-      setStatusMessage("少なくとも1つファイルを追加してください。");
-      return;
-    }
-    if (selectedPlaylistId) {
-      setPlaylists((prev) =>
-        prev.map((playlist) =>
-          playlist.id === selectedPlaylistId
-            ? { ...playlist, name: playlistDraftName.trim(), fileIds: playlistDraftFileIds }
-            : playlist,
-        ),
-      );
-      setStatusMessage("プレイリストを更新しました。");
-    } else {
-      const newPlaylist: Playlist = {
-        id: crypto.randomUUID(),
-        name: playlistDraftName.trim(),
-        fileIds: playlistDraftFileIds,
-      };
-      setPlaylists((prev) => [...prev, newPlaylist]);
-      setSelectedPlaylistId(newPlaylist.id);
-      setStatusMessage("プレイリストを保存しました。");
+  const handleNameReset = (id: string) => {
+    clearNameDraft(id);
+  };
+
+  const handleNameKeyDown = (event: KeyboardEvent<HTMLInputElement>, id: string) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleNameCommit(id);
     }
   };
 
-  const handleDeletePlaylist = () => {
-    if (!selectedPlaylistId) return;
-    const playlist = playlists.find((p) => p.id === selectedPlaylistId);
+  const handlePlaylistSelect = (id: string) => {
+    const playlist = playlists.find((entry) => entry.id === id);
     if (!playlist) return;
-    const ok = window.confirm(`「${playlist.name}」を削除しますか？`);
-    if (!ok) return;
-    setPlaylists((prev) => prev.filter((p) => p.id !== selectedPlaylistId));
-    if (alarm.playlistId === selectedPlaylistId) {
-      setAlarm((prev) => ({ ...prev, playlistId: null, isOn: false, nextTrigger: null }));
-      clearAlarmTimeout();
-      stopPlayback();
-    }
-    handleSelectPlaylist(null);
-    setStatusMessage("プレイリストを削除しました。");
+    setEditingPlaylist({ ...playlist });
+    setUnpersistedId(null);
   };
 
-  const updateAlarm = (changes: Partial<AlarmSetting>) => {
-    setAlarm((prev) => ({ ...prev, ...changes }));
+  const handleCreatePlaylist = () => {
+    const newId = crypto.randomUUID();
+    setEditingPlaylist({ id: newId, name: "新しいプレイリスト", fileIds: [] });
+    setUnpersistedId(newId);
   };
 
-  const handleToggleAlarm = () => {
-    if (alarm.isOn) {
-      updateAlarm({ isOn: false, nextTrigger: null });
-      clearAlarmTimeout();
-      stopPlayback();
-      return;
-    }
-    if (!alarm.time || !alarm.playlistId) {
-      setStatusMessage("時刻とプレイリストを選択してください。");
-      return;
-    }
-    const next = computeNextTrigger(alarm.time);
-    updateAlarm({ isOn: true, nextTrigger: next });
-    setStatusMessage(`アラームをONにしました。次回: ${new Date(next).toLocaleString()}`);
+  const updateEditingPlaylist = (updater: (prev: Playlist) => Playlist) => {
+    setEditingPlaylist((prev) => (prev ? updater(prev) : prev));
   };
 
-  // Skip files that no longer have an object URL (after reload)
-  useEffect(() => {
-    if (!playbackState) return;
-    const playlist = playlists.find((p) => p.id === playbackState.playlistId);
-    if (!playlist) {
-      stopPlayback();
+  const handlePlaylistSave = () => {
+    if (!editingPlaylist) return;
+    if (!editingPlaylist.name.trim()) return;
+    setPlaylists((prev) => {
+      const exists = prev.some((playlist) => playlist.id === editingPlaylist.id);
+      if (exists) {
+        return prev.map((playlist) => (playlist.id === editingPlaylist.id ? editingPlaylist : playlist));
+      }
+      return [...prev, editingPlaylist];
+    });
+    setUnpersistedId(null);
+  };
+
+  const handlePlaylistDelete = (id: string) => {
+    setPlaylists((prev) => prev.filter((playlist) => playlist.id !== id));
+    if (alarm.playlistId === id) {
+      setAlarm((prev) => ({ ...prev, playlistId: null, isOn: false, nextTrigger: undefined }));
+    }
+    if (editingPlaylist?.id === id) {
+      setEditingPlaylist(null);
+    }
+  };
+
+  const handleAlarmToggle = () => {
+    if (!alarm.playlistId) {
+      setPlaybackMessage("プレイリストを選択してください");
       return;
     }
-    const fileId = playlist.fileIds[playbackState.index];
-    if (!fileId) {
-      finishPlayback();
+    const playlist = playlists.find((entry) => entry.id === alarm.playlistId);
+    if (!playlist || playlist.fileIds.length === 0) {
+      setPlaybackMessage("ファイルが入ったプレイリストを選んでください");
       return;
     }
-    if (!sessionUrls.current[fileId]) {
-      advanceTrack();
+    if (!alarm.isOn) {
+      const next = calculateNextTrigger(alarm.time);
+      setAlarm((prev) => ({ ...prev, isOn: true, nextTrigger: next?.toISOString() }));
+    } else {
+      detachAlarmTimeout();
+      setAlarm((prev) => ({ ...prev, isOn: false, nextTrigger: undefined }));
     }
-  }, [advanceTrack, finishPlayback, playbackState, playlists, stopPlayback]);
+  };
 
-  const currentTrack = useMemo(() => {
-    if (!playbackState) return null;
-    const playlist = playlists.find((p) => p.id === playbackState.playlistId);
-    if (!playlist) return null;
-    const fileId = playlist.fileIds[playbackState.index];
-    return mediaFiles.find((file) => file.id === fileId) ?? null;
-  }, [mediaFiles, playbackState, playlists]);
+  const playlistCards = playlists.map((playlist) => {
+    const duration = playlistDurationSec(playlist, mediaFiles);
+    return (
+      <button
+        key={playlist.id}
+        className={`rounded-2xl bg-white/70 p-4 text-left shadow-sm transition hover:shadow-md ${
+          editingPlaylist?.id === playlist.id ? "ring-2 ring-[#c5afff]" : ""
+        }`}
+        onClick={() => handlePlaylistSelect(playlist.id)}
+      >
+        <p className="text-lg font-semibold text-slate-900">{playlist.name}</p>
+        <p className="text-sm text-slate-500">{playlist.fileIds.length}ファイル</p>
+        <p className="text-sm text-[#3f8f7e]">合計 {formatDuration(duration)}</p>
+      </button>
+    );
+  });
 
-  const currentTrackUrl = currentTrack ? sessionUrls.current[currentTrack.id] : null;
-  const missingObjectUrl = !!currentTrack && !currentTrackUrl;
-  const trackIsVideo = currentTrack?.kind === "video";
+  const availableMediaOptions = mediaFiles.map((file) => (
+    <option key={file.id} value={file.id}>
+      {file.name}
+    </option>
+  ));
 
-  const attemptPlay = useCallback(() => {
-    const element = mediaElementRef.current;
-    if (!element) return;
-    const playResult = element.play();
-    if (!playResult) return;
-    playResult
-      .then(() => {
-        setNeedsManualPlay(false);
-        setStatusMessage(null);
-      })
-      .catch(() => {
-        setNeedsManualPlay(true);
-        setStatusMessage("ブラウザの自動再生がブロックされました。下のボタンで再生を開始してください。");
-      });
-  }, []);
+  const currentPlaylistName = useMemo(() => playlists.find((p) => p.id === playbackPlaylistId)?.name ?? "--", [playlists, playbackPlaylistId]);
 
-  useEffect(() => {
-    if (!currentTrack || missingObjectUrl) {
-      setNeedsManualPlay(false);
-      return;
-    }
-    attemptPlay();
-  }, [attemptPlay, currentTrack, missingObjectUrl]);
-
-  const nextAlarmDate = alarm.nextTrigger ? new Date(alarm.nextTrigger) : null;
-
-  const playlistNameForAlarm =
-    alarm.playlistId ? playlists.find((p) => p.id === alarm.playlistId)?.name ?? "不明" : "未選択";
+  const currentPlaylistProgressText = isPlaying
+    ? `残り ${formatRemaining(progressSnapshot.remaining)} / 進捗 ${progressSnapshot.percent}%`
+    : "停止中";
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-zinc-100 py-12">
-      <div className="mx-auto flex max-w-6xl flex-col gap-8 px-4">
-        <header className="text-center">
-          <p className="text-sm uppercase tracking-widest text-zinc-500">好きな動画で起きるアラーム</p>
-          <h1 className="mt-2 text-4xl font-bold text-zinc-900">Rise Beat</h1>
-          <p className="mt-3 text-zinc-600">
-            ローカルの動画・音声を読み込んで、朝のテンションを上げるアラームを作りましょう。
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#f1edff,_#d4c1ff_45%,_#b6ffe5_80%,_#e9fff7)] text-slate-900">
+      <div className="mx-auto flex max-w-6xl flex-col gap-8 px-6 py-10 lg:px-10">
+        <header className="flex flex-col gap-2">
+          <h1 className="text-4xl font-semibold tracking-tight text-[#5d3d82] md:text-5xl">Rise Beat</h1>
+          <p className="text-xs uppercase tracking-[0.4em] text-[#3d8b7b]">
+            お気に入りのプレイリストで目覚めるアラーム
+          </p>
+          <p className="text-base text-slate-700">
+            ファイルをアップロードしてプレイリストを作成し、毎朝のルーティンに合わせてアラームを鳴らしましょう。
           </p>
         </header>
 
-        {statusMessage && (
-          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            {statusMessage}
-          </div>
-        )}
-
-        <section className={cardClass}>
-          <h2 className={sectionTitleClass}>1. ファイルを読み込む</h2>
-          <p className="mt-2 text-sm text-zinc-600">
-            ここで読み込んだファイルはブラウザ内でのみ管理され、セッションが変わると再生できなくなります。
-          </p>
-          <div className="mt-4 flex flex-col gap-4 md:flex-row md:items-center">
-            <input
-              type="file"
-              accept="video/*,audio/*"
-              multiple
-              onChange={handleFileChange}
-              className="w-full rounded-lg border border-dashed border-zinc-300 px-4 py-3 text-sm text-zinc-600"
-            />
-            <p className="text-xs text-zinc-500 md:w-56">
-              ※ 音声/動画ファイルのみ。プレイリストで利用する前に先に読み込んでください。
-            </p>
-          </div>
-
-          <div className="mt-6">
-            <h3 className="text-base font-semibold text-zinc-800">読み込み済みファイル</h3>
-            {mediaFiles.length === 0 && (
-              <p className="mt-2 text-sm text-zinc-500">まだファイルがありません。</p>
-            )}
-            <ul className="mt-3 space-y-2">
-              {mediaFiles.map((file) => (
-                <li
-                  key={file.id}
-                  className="flex flex-wrap items-center justify-between rounded-xl border border-zinc-200 px-4 py-3"
-                >
-                  <div>
-                    <p className="font-medium text-zinc-900">{file.name}</p>
-                    <p className="text-xs text-zinc-500">
-                      {file.kind === "video" ? "動画" : "音声"} / {file.mimeType}
-                      {!sessionUrls.current[file.id] && (
-                        <span className="ml-2 text-rose-500">再生不可 (再度読み込みが必要)</span>
-                      )}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => handleRemoveMedia(file.id)}
-                    className="mt-2 text-sm text-rose-600 hover:text-rose-700 md:mt-0"
-                  >
-                    削除
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </section>
-
-        <section className={cardClass}>
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <h2 className={sectionTitleClass}>2. プレイリストを作成・編集</h2>
-            <button
-              onClick={() => handleSelectPlaylist(null)}
-              className="rounded-full border border-zinc-300 px-4 py-1 text-sm text-zinc-600 transition hover:border-zinc-400"
-            >
-              新規作成
-            </button>
-          </div>
-
-          <div className="mt-4 grid gap-6 lg:grid-cols-5">
-            <div className="space-y-3 rounded-xl bg-zinc-50 p-4 lg:col-span-2">
-              <p className="text-sm font-medium text-zinc-700">既存プレイリスト</p>
-              {playlists.length === 0 && (
-                <p className="text-sm text-zinc-500">まだ作成されていません。</p>
-              )}
-              <div className="flex flex-col gap-2">
-                {playlists.map((playlist) => (
-                  <button
-                    key={playlist.id}
-                    onClick={() => handleSelectPlaylist(playlist.id)}
-                    className={`rounded-lg border px-3 py-2 text-left text-sm transition ${
-                      playlist.id === selectedPlaylistId
-                        ? "border-blue-500 bg-blue-50 text-blue-700"
-                        : "border-transparent bg-white text-zinc-700 hover:border-zinc-200"
-                    }`}
-                  >
-                    <span className="font-medium">{playlist.name}</span>
-                    <span className="ml-2 text-xs text-zinc-500">{playlist.fileIds.length}件</span>
-                  </button>
-                ))}
-              </div>
+        <section className="grid gap-6 lg:grid-cols-2">
+          <div className="rounded-3xl bg-white/80 p-6 shadow-xl backdrop-blur">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">ファイルライブラリ</h2>
+              <label className="cursor-pointer rounded-full bg-[#cdb6ff] px-4 py-2 text-sm font-semibold text-slate-900 transition hover:bg-[#bba4f3]">
+                追加する
+                <input
+                  type="file"
+                  className="hidden"
+                  multiple
+                  onChange={handleUpload}
+                  accept="audio/*,video/*"
+                />
+              </label>
             </div>
+            <p className="mt-2 text-sm text-slate-500">
+              ブラウザに安全に保存され、再読み込み後もそのまま再生できます。
+            </p>
+            <div className="mt-4 flex max-h-[360px] flex-col gap-3 overflow-y-auto pr-1">
+              {mediaFiles.length === 0 && (
+                <p className="text-sm text-slate-500">まだファイルがありません。</p>
+              )}
+              {mediaFiles.map((file) => {
+                const draftName = nameDrafts[file.id] ?? file.name;
+                const canSave = draftName.trim().length > 0 && draftName.trim() !== file.name;
+                const isEditing = nameDrafts[file.id] !== undefined;
+                return (
+                  <div key={file.id} className="rounded-2xl bg-white/70 p-3 text-sm text-slate-700 shadow-sm">
+                    <div className="flex flex-col gap-1">
+                      <input
+                        value={draftName}
+                        onChange={(event) => updateNameDraft(file.id, event.target.value)}
+                        onKeyDown={(event) => handleNameKeyDown(event, file.id)}
+                        className="rounded-lg border border-[#d6c9ff] bg-white px-3 py-1.5 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#aef5d9]"
+                      />
+                      <div className="flex flex-wrap gap-x-3 text-xs text-slate-500">
+                        <span>{file.kind.toUpperCase()}</span>
+                        <span>追加 {new Date(file.createdAt).toLocaleDateString()}</span>
+                        <span>再生 {formatDuration(file.durationSec)}</span>
+                        <span>{file.hasBlob ? "保存済み" : "再生不可 (旧データ)"}</span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-2">
+                        <button
+                          className="rounded-full bg-[#cdb6ff] px-3 py-1 text-xs font-semibold text-slate-900 disabled:opacity-40"
+                          onClick={() => handleNameCommit(file.id)}
+                          disabled={!canSave}
+                        >
+                          名前を保存
+                        </button>
+                        {isEditing && (
+                          <button
+                            className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700"
+                            onClick={() => handleNameReset(file.id)}
+                          >
+                            リセット
+                          </button>
+                        )}
+                        <button
+                          className="rounded-full bg-[#9fffe0] px-3 py-1 text-xs font-semibold text-slate-900"
+                          onClick={() => handleRemoveMedia(file.id)}
+                        >
+                          削除
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
 
-            <div className="lg:col-span-3">
-              <div className="space-y-4">
-                <label className="block text-sm font-medium text-zinc-700">
-                  プレイリスト名
+          <div className="rounded-3xl bg-white/80 p-6 shadow-xl backdrop-blur">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">プレイリスト</h2>
+              <button
+                className="rounded-full bg-[#cdb6ff] px-4 py-2 text-sm font-semibold text-slate-900 transition hover:bg-[#bba4f3]"
+                onClick={handleCreatePlaylist}
+              >
+                新規作成
+              </button>
+            </div>
+            <p className="mt-2 text-sm text-slate-500">
+              合計時間を参考に、朝のタスクに合わせた順序で並べ替えてください。
+            </p>
+            <div className="mt-4 grid gap-3 lg:grid-cols-2">
+              {playlistCards.length > 0 ? playlistCards : <p className="text-sm text-slate-500">プレイリストがありません。</p>}
+            </div>
+            {editingPlaylist && (
+              <div className="mt-5 rounded-2xl bg-white/70 p-4 shadow-sm">
+                <div className="flex flex-col gap-3">
                   <input
-                    value={playlistDraftName}
-                    onChange={(event) => setPlaylistDraftName(event.target.value)}
-                    className="mt-1 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm"
-                    placeholder="例：朝テンション爆上げ"
+                    value={editingPlaylist.name}
+                    onChange={(event) =>
+                      updateEditingPlaylist((prev) => ({ ...prev, name: event.target.value }))
+                    }
+                    className="w-full rounded-xl border border-[#d6c9ff] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#aef5d9]"
                   />
-                </label>
-
-                <div className="flex flex-wrap gap-3">
-                  <select
-                    className="flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-sm"
-                    onChange={(event) => handleAddFileToDraft(event.target.value)}
-                    value=""
-                    disabled={mediaFiles.length === 0}
-                  >
-                    <option value="" disabled>
-                      追加するファイルを選択
-                    </option>
-                    {mediaFiles.map((file) => (
-                      <option key={file.id} value={file.id}>
-                        {file.name}
-                      </option>
-                    ))}
-                  </select>
-                  <p className="text-xs text-zinc-500">選択すると末尾に追加されます。</p>
-                </div>
-
-                <div>
-                  <p className="text-sm font-medium text-zinc-700">収録ファイル（再生順）</p>
-                  {playlistDraftFileIds.length === 0 && (
-                    <p className="mt-2 text-sm text-zinc-500">ファイルを追加してください。</p>
-                  )}
-                  <ul className="mt-3 space-y-2">
-                    {playlistDraftFileIds.map((fileId, index) => {
-                      const file = mediaFiles.find((item) => item.id === fileId);
+                  <div className="text-sm text-slate-600">
+                    合計 {editingPlaylistDuration} / {editingPlaylist.fileIds.length} トラック
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {editingPlaylist.fileIds.map((id, index) => {
+                      const file = mediaFiles.find((entry) => entry.id === id);
                       if (!file) return null;
                       return (
-                        <li
-                          key={`${fileId}-${index}`}
-                          className="flex flex-wrap items-center justify-between rounded-xl border border-zinc-200 px-4 py-3 text-sm"
+                        <div
+                          key={id}
+                          className="flex items-center justify-between rounded-xl bg-white px-3 py-2 text-sm shadow-sm"
                         >
                           <div>
-                            <p className="font-medium text-zinc-900">
-                              {index + 1}. {file.name}
-                            </p>
-                            {!sessionUrls.current[file.id] && (
-                              <p className="text-xs text-rose-500">※ このセッションでは再生できません</p>
-                            )}
+                            <p className="font-semibold">{file.name}</p>
+                            <p className="text-xs text-slate-500">{formatDuration(file.durationSec)}</p>
                           </div>
-                          <div className="flex items-center gap-2 text-xs">
+                          <div className="flex gap-2">
                             <button
-                              onClick={() => moveDraftItem(index, -1)}
-                              className="rounded-full border border-zinc-300 px-2 py-1 text-zinc-600 disabled:opacity-30"
-                              disabled={index === 0}
+                              className="rounded-full bg-[#cdb6ff] px-2 py-1 text-xs font-semibold text-slate-900 disabled:opacity-40"
+                              onClick={() =>
+                                updateEditingPlaylist((prev) => {
+                                  const copy = [...prev.fileIds];
+                                  if (index === 0) return prev;
+                                  [copy[index - 1], copy[index]] = [copy[index], copy[index - 1]];
+                                  return { ...prev, fileIds: copy };
+                                })
+                              }
                             >
                               ↑
                             </button>
                             <button
-                              onClick={() => moveDraftItem(index, 1)}
-                              className="rounded-full border border-zinc-300 px-2 py-1 text-zinc-600 disabled:opacity-30"
-                              disabled={index === playlistDraftFileIds.length - 1}
+                              className="rounded-full bg-[#cdb6ff] px-2 py-1 text-xs font-semibold text-slate-900 disabled:opacity-40"
+                              onClick={() =>
+                                updateEditingPlaylist((prev) => {
+                                  const copy = [...prev.fileIds];
+                                  if (index === copy.length - 1) return prev;
+                                  [copy[index + 1], copy[index]] = [copy[index], copy[index + 1]];
+                                  return { ...prev, fileIds: copy };
+                                })
+                              }
                             >
                               ↓
                             </button>
                             <button
-                              onClick={() => removeDraftItem(index)}
-                              className="rounded-full border border-rose-200 px-3 py-1 text-rose-600"
+                              className="rounded-full bg-[#ffd3e2] px-2 py-1 text-xs font-semibold text-[#8b223f]"
+                              onClick={() =>
+                                updateEditingPlaylist((prev) => ({
+                                  ...prev,
+                                  fileIds: prev.fileIds.filter((fileId) => fileId !== id),
+                                }))
+                              }
                             >
-                              除外
+                              削除
                             </button>
                           </div>
-                        </li>
+                        </div>
                       );
                     })}
-                  </ul>
-                </div>
-
-                <div className="flex flex-wrap gap-3">
-                  <button
-                    onClick={handleSavePlaylist}
-                    className="rounded-full bg-blue-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-blue-500"
+                  </div>
+                  <select
+                    className="rounded-xl border border-[#d6c9ff] bg-white px-3 py-2 text-sm"
+                    value=""
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (!value) return;
+                      updateEditingPlaylist((prev) => ({
+                        ...prev,
+                        fileIds: prev.fileIds.concat(value),
+                      }));
+                    }}
                   >
-                    プレイリストを保存
-                  </button>
-                  {selectedPlaylistId && (
+                    <option value="" disabled>
+                      ファイルを追加
+                    </option>
+                    {availableMediaOptions}
+                  </select>
+                  <div className="flex flex-wrap gap-2">
                     <button
-                      onClick={handleDeletePlaylist}
-                      className="rounded-full border border-rose-300 px-6 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-50"
+                      className="rounded-full bg-[#cdb6ff] px-4 py-2 text-sm font-semibold text-slate-900 disabled:opacity-50"
+                      onClick={handlePlaylistSave}
+                      disabled={!editingPlaylist.name.trim() || editingPlaylist.fileIds.length === 0}
                     >
-                      削除
+                      保存
                     </button>
-                  )}
+                    <button
+                      className="rounded-full bg-[#9fffe0] px-4 py-2 text-sm font-semibold text-slate-900 disabled:opacity-50"
+                      disabled={!editingPlaylistIsSaved || editingPlaylist.fileIds.length === 0}
+                      onClick={() => startPlayback(editingPlaylist.id)}
+                    >
+                      すぐに再生
+                    </button>
+                    {editingPlaylist && (
+                      <button
+                        className="rounded-full border border-slate-300 px-4 py-2 text-sm text-slate-700"
+                        onClick={() =>
+                          setEditingPlaylist(
+                            unpersistedId === editingPlaylist.id
+                              ? null
+                              : playlists.find((playlist) => playlist.id === editingPlaylist.id) ?? null,
+                          )
+                        }
+                      >
+                        リセット
+                      </button>
+                    )}
+                    {editingPlaylist && (
+                      <button
+                        className="rounded-full bg-[#ffd3e2] px-4 py-2 text-sm font-semibold text-[#8b223f]"
+                        onClick={() => handlePlaylistDelete(editingPlaylist.id)}
+                      >
+                        プレイリスト削除
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          </div>
-        </section>
-
-        <section className={cardClass}>
-          <h2 className={sectionTitleClass}>3. アラーム設定</h2>
-          <div className="mt-4 grid gap-4 md:grid-cols-2">
-            <label className="block text-sm font-medium text-zinc-700">
-              時刻
-              <input
-                type="time"
-                value={alarm.time}
-                onChange={(event) => updateAlarm({ time: event.target.value })}
-                className="mt-1 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm"
-              />
-            </label>
-            <label className="block text-sm font-medium text-zinc-700">
-              使用するプレイリスト
-              <select
-                value={alarm.playlistId ?? ""}
-                onChange={(event) => updateAlarm({ playlistId: event.target.value || null })}
-                className="mt-1 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm"
-              >
-                <option value="">選択してください</option>
-                {playlists.map((playlist) => (
-                  <option key={playlist.id} value={playlist.id} disabled={playlist.fileIds.length === 0}>
-                    {playlist.name} {playlist.fileIds.length === 0 ? "(ファイルなし)" : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <label className="mt-4 block text-sm font-medium text-zinc-700">
-            タスクメモ
-            <textarea
-              value={alarm.memo}
-              onChange={(event) => updateAlarm({ memo: event.target.value })}
-              className="mt-1 min-h-[120px] w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm"
-              placeholder="今日のタスクを書き留めておきましょう。"
-            />
-          </label>
-
-          <div className="mt-4 flex flex-wrap items-center gap-4">
-            <button
-              onClick={handleToggleAlarm}
-              className={`rounded-full px-8 py-3 text-sm font-semibold text-white transition ${
-                alarm.isOn ? "bg-rose-500 hover:bg-rose-400" : "bg-emerald-600 hover:bg-emerald-500"
-              }`}
-            >
-              アラームを{alarm.isOn ? "OFF" : "ON"}にする
-            </button>
-            {alarm.isOn && nextAlarmDate && (
-              <p className="text-sm text-zinc-600">
-                次のアラーム: {nextAlarmDate.toLocaleString("ja-JP", { hour12: false })}
-              </p>
             )}
           </div>
         </section>
 
-        <section className={cardClass}>
-          <h2 className={sectionTitleClass}>4. 現在のアラーム / 再生</h2>
-          {alarm.isOn ? (
-            <div className="mt-3 space-y-2 rounded-xl bg-zinc-50 p-4 text-sm text-zinc-700">
-              <p>
-                <span className="font-semibold text-zinc-900">次のアラーム:</span>{" "}
-                {nextAlarmDate
-                  ? nextAlarmDate.toLocaleString("ja-JP", { hour12: false })
-                  : "計算中"}
-              </p>
-              <p>
-                <span className="font-semibold text-zinc-900">プレイリスト:</span> {playlistNameForAlarm}
-              </p>
-              <div>
-                <p className="font-semibold text-zinc-900">タスク:</p>
-                <pre className="mt-1 whitespace-pre-wrap text-sm">{alarm.memo || "（未入力）"}</pre>
-              </div>
+        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+          <div className="rounded-3xl bg-white/80 p-6 shadow-lg backdrop-blur">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">アラーム</h2>
+              <button
+                className={`rounded-full px-4 py-2 text-sm font-semibold ${
+                  alarm.isOn ? "bg-[#9fffe0] text-slate-900" : "bg-[#e5dafc]"
+                }`}
+                onClick={handleAlarmToggle}
+              >
+                {alarm.isOn ? "停止" : "セット"}
+              </button>
             </div>
-          ) : (
-            <p className="mt-3 rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">アラームはOFFです。</p>
-          )}
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <label className="flex flex-col text-sm text-slate-600">
+                開始時刻
+                <input
+                  type="time"
+                  value={alarm.time}
+                  className="mt-1 rounded-xl border border-[#d6c9ff] bg-white px-3 py-2 text-base text-slate-900"
+                  onChange={(event) =>
+                    setAlarm((prev) => ({
+                      ...prev,
+                      time: event.target.value,
+                      nextTrigger: prev.isOn ? calculateNextTrigger(event.target.value)?.toISOString() : prev.nextTrigger,
+                    }))
+                  }
+                />
+              </label>
+              <label className="flex flex-col text-sm text-slate-600">
+                プレイリスト
+                <select
+                  value={alarm.playlistId ?? ""}
+                  className="mt-1 rounded-xl border border-[#d6c9ff] bg-white px-3 py-2 text-base text-slate-900"
+                  onChange={(event) =>
+                    setAlarm((prev) => ({
+                      ...prev,
+                      playlistId: event.target.value || null,
+                    }))
+                  }
+                >
+                  <option value="">未選択</option>
+                  {playlists.map((playlist) => (
+                    <option key={playlist.id} value={playlist.id}>
+                      {playlist.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="mt-4 flex flex-col text-sm text-slate-600">
+              メモ
+              <textarea
+                className="mt-1 h-24 rounded-2xl border border-[#d6c9ff] bg-white p-3 text-slate-900"
+                value={alarm.memo}
+                onChange={(event) => setAlarm((prev) => ({ ...prev, memo: event.target.value }))}
+              />
+            </label>
+            <div className="mt-4 grid gap-2 text-sm text-slate-600">
+              <p>プレイリスト合計時間: {formatDuration(alarmPlaylistDurationSec)}</p>
+              <p>終了予定時刻: {plannedEndDate ? `${formatClock(plannedEndDate)} ごろ` : "--"}</p>
+              {plannedStartDate && plannedEndDate && plannedEndDate < plannedStartDate && (
+                <p className="text-xs text-[#e27fa5]">※日付をまたぎます</p>
+              )}
+            </div>
+          </div>
 
-          <div className="mt-6 rounded-2xl border border-dashed border-zinc-200 p-4">
-            <p className="text-sm font-semibold text-zinc-800">再生ステータス</p>
-            {isAlarmRinging && currentTrack ? (
-              <div className="mt-3 space-y-3">
-                <p className="text-zinc-700">
-                  再生中: <span className="font-semibold text-zinc-900">{currentTrack.name}</span>
-                </p>
-                {missingObjectUrl ? (
-                  <p className="text-sm text-rose-500">
-                    ファイルを再生できません。もう一度ファイルを読み込んでください。
-                  </p>
-                ) : trackIsVideo ? (
+          <div className="rounded-3xl bg-white/80 p-6 shadow-lg backdrop-blur">
+            <h2 className="text-xl font-semibold">再生ステータス</h2>
+            <div className="mt-4 space-y-3 text-sm text-slate-600">
+              <p>対象プレイリスト: {currentPlaylistName}</p>
+              <p>
+                現在のトラック: {currentTrack?.name ?? "--"}{" "}
+                {currentTrack && `(${formatDuration(currentTrack.durationSec)})`}
+              </p>
+              <p>状態: {playbackMessage}</p>
+              <p>{currentPlaylistProgressText}</p>
+            </div>
+            <div className="mt-4 h-2 rounded-full bg-slate-200">
+              <div
+                className="h-full rounded-full bg-[#9fffe0] transition-all"
+                style={{ width: `${progressSnapshot.percent}%` }}
+              />
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button className="rounded-full bg-[#9fffe0] px-4 py-2 text-sm font-semibold text-slate-900" onClick={stopPlayback}>
+                停止
+              </button>
+              {currentTrack?.kind === "video" && (
+                <button
+                  className="rounded-full bg-[#e5dafc] px-4 py-2 text-sm font-semibold text-slate-900"
+                  onClick={handleEnterFullscreen}
+                  disabled={!currentTrackUrl}
+                >
+                  全画面表示
+                </button>
+              )}
+              {needsManualPlay && (
+                <button className="rounded-full bg-[#9fffe0] px-4 py-2 text-sm font-semibold text-slate-900" onClick={handleManualPlay}>
+                  再生を開始する
+                </button>
+              )}
+            </div>
+            {currentTrack && (
+              <div className="mt-6 rounded-2xl bg-white/70 p-4 shadow-inner">
+                {currentTrack?.kind === "video" ? (
                   <video
-                    key={currentTrack.id}
+                    key={currentTrackUrl ?? currentTrack.id}
                     ref={(element) => {
                       mediaElementRef.current = element;
                     }}
-                    src={currentTrackUrl ?? ""}
-                    className="w-full rounded-xl bg-black"
-                    autoPlay
+                    src={currentTrackUrl ?? undefined}
+                    controls={false}
+                    className="aspect-video w-full rounded-xl bg-black"
                     onEnded={() => advanceTrack()}
+                    onCanPlay={() => attemptPlay()}
                   />
                 ) : (
                   <audio
-                    key={currentTrack.id}
+                    key={currentTrackUrl ?? currentTrack.id}
                     ref={(element) => {
                       mediaElementRef.current = element;
                     }}
-                    src={currentTrackUrl ?? ""}
-                    className="w-full"
-                    autoPlay
+                    src={currentTrackUrl ?? undefined}
+                    onCanPlay={() => attemptPlay()}
                     onEnded={() => advanceTrack()}
+                    controls={false}
+                    className="w-full"
                   />
                 )}
-                {needsManualPlay && (
-                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-                    <p>ブラウザの自動再生がブロックされました。下のボタンを押して再生を開始してください。</p>
-                    <button
-                      onClick={attemptPlay}
-                      className="mt-3 rounded-full bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-400"
-                    >
-                      再生を開始する
-                    </button>
-                  </div>
+                {missingObjectUrl && (
+                  <p className="mt-2 text-xs text-[#e27fa5]">ファイルが見つからないためスキップしました。</p>
                 )}
-                <button
-                  onClick={stopPlayback}
-                  className="rounded-full bg-rose-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-rose-500"
-                >
-                  止める
-                </button>
               </div>
-            ) : (
-              <p className="mt-3 text-sm text-zinc-500">再生しているプレイリストはありません。</p>
             )}
           </div>
         </section>

@@ -200,11 +200,16 @@ export default function Home() {
   const [playbackMessage, setPlaybackMessage] = useState<string>("待機中");
   const [isPlaying, setIsPlaying] = useState(false);
   const [missingObjectUrl, setMissingObjectUrl] = useState(false);
+  const [userInteracted, setUserInteracted] = useState(false);
   const sessionUrls = useRef(new Map<string, string>());
   const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
   const alarmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const processedDurations = useRef(new Set<string>());
   const [progressSnapshot, setProgressSnapshot] = useState({ remaining: 0, percent: 0 });
+  const isiOS = useMemo(() => {
+    if (!isBrowser()) return false;
+    return /iP(hone|ad|od)/i.test(window.navigator.userAgent);
+  }, []);
   const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
 
   /* eslint-disable react-hooks/set-state-in-effect */
@@ -247,6 +252,19 @@ export default function Home() {
     if (!ready || !isBrowser()) return;
     window.localStorage.setItem(ALARM_KEY, JSON.stringify(alarm));
   }, [alarm, ready]);
+
+  useEffect(() => {
+    if (!isBrowser()) return;
+    const handleFirstInteraction = () => {
+      setUserInteracted(true);
+    };
+    window.addEventListener("pointerdown", handleFirstInteraction, { once: true });
+    window.addEventListener("keydown", handleFirstInteraction, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", handleFirstInteraction);
+      window.removeEventListener("keydown", handleFirstInteraction);
+    };
+  }, []);
 
   useEffect(() => {
     const cache = sessionUrls.current;
@@ -326,13 +344,20 @@ export default function Home() {
         setIsPlaying(false);
         return;
       }
+      const requiresManualStart = fromAlarm && isiOS && !userInteracted;
       setPlaybackPlaylistId(playlistId);
       setCurrentTrackIndex(0);
       setIsPlaying(true);
-      setNeedsManualPlay(false);
-      setPlaybackMessage(fromAlarm ? "アラームから再生を開始しました" : "再生を開始しました");
+      setNeedsManualPlay(requiresManualStart);
+      setPlaybackMessage(
+        requiresManualStart
+          ? "iPhoneでは「再生を開始する」をタップして再生してください"
+          : fromAlarm
+            ? "アラームから再生を開始しました"
+            : "再生を開始しました",
+      );
     },
-    [playlists],
+    [isiOS, playlists, userInteracted],
   );
 
   useEffect(() => {
@@ -387,16 +412,22 @@ export default function Home() {
   );
 
   const attemptPlay = useCallback(async () => {
-    if (!mediaElementRef.current) return;
+    const element = mediaElementRef.current;
+    if (!element) return;
+    if (isiOS && !userInteracted) {
+      setNeedsManualPlay(true);
+      setPlaybackMessage("再生を開始するボタンをタップしてください");
+      return;
+    }
     try {
-      await mediaElementRef.current.play();
+      await element.play();
       setNeedsManualPlay(false);
       setPlaybackMessage("再生中");
     } catch {
       setNeedsManualPlay(true);
       setPlaybackMessage("自動再生できません。ボタンで開始してください");
     }
-  }, []);
+  }, [isiOS, userInteracted]);
 
   useEffect(() => {
     let cancelled = false;
@@ -423,6 +454,7 @@ export default function Home() {
   }, [currentTrack, loadTrackUrl, advanceTrack]);
 
   const handleManualPlay = () => {
+    setUserInteracted(true);
     void attemptPlay();
   };
 
@@ -500,6 +532,9 @@ export default function Home() {
   };
 
   const handleRemoveMedia = async (id: string) => {
+    if (!window.confirm("このファイルを削除しますか？")) {
+      return;
+    }
     const alarmPlaylistId = alarm.playlistId;
     setPlaylists((prev) => {
       const updated = prev.map((playlist) => ({
@@ -605,6 +640,11 @@ export default function Home() {
   };
 
   const handlePlaylistDelete = (id: string) => {
+    if (
+      !window.confirm("このプレイリストを削除しますか？")
+    ) {
+      return;
+    }
     setPlaylists((prev) => prev.filter((playlist) => playlist.id !== id));
     if (alarm.playlistId === id) {
       setAlarm((prev) => ({ ...prev, playlistId: null, isOn: false, nextTrigger: undefined }));

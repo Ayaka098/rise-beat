@@ -362,11 +362,12 @@ export default function Home() {
 
   useEffect(() => {
     detachAlarmTimeout();
-    if (!alarm.isOn || !alarm.nextTrigger || !alarm.playlistId) return;
+    const playlistId = alarm.playlistId;
+    if (!alarm.isOn || !alarm.nextTrigger || !playlistId) return;
     const target = new Date(alarm.nextTrigger).getTime();
     const delay = Math.max(target - Date.now(), 0);
     alarmTimeoutRef.current = setTimeout(() => {
-      startPlayback(alarm.playlistId, true);
+      startPlayback(playlistId, true);
       const next = calculateNextTrigger(alarm.time);
       setAlarm((prev) => ({
         ...prev,

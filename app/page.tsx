@@ -429,10 +429,21 @@ export default function Home() {
 
   const handleEnterFullscreen = () => {
     const element = mediaElementRef.current;
-    if (element instanceof HTMLVideoElement && element.requestFullscreen) {
+    if (!(element instanceof HTMLVideoElement)) return;
+    const webkitEnterFullscreen = (element as HTMLVideoElement & { webkitEnterFullscreen?: () => void })
+      .webkitEnterFullscreen;
+    if (element.requestFullscreen) {
       element.requestFullscreen().catch(() => {
         // ignore
       });
+      return;
+    }
+    if (webkitEnterFullscreen) {
+      try {
+        webkitEnterFullscreen.call(element);
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -501,6 +512,9 @@ export default function Home() {
   };
 
   const handleRemoveMedia = async (id: string) => {
+    if (!window.confirm("このファイルを削除しますか？")) {
+      return;
+    }
     const alarmPlaylistId = alarm.playlistId;
     setPlaylists((prev) => {
       const updated = prev.map((playlist) => ({
@@ -606,6 +620,9 @@ export default function Home() {
   };
 
   const handlePlaylistDelete = (id: string) => {
+    if (!window.confirm("このプレイリストを削除しますか？")) {
+      return;
+    }
     setPlaylists((prev) => prev.filter((playlist) => playlist.id !== id));
     if (alarm.playlistId === id) {
       setAlarm((prev) => ({ ...prev, playlistId: null, isOn: false, nextTrigger: undefined }));
@@ -1006,6 +1023,7 @@ export default function Home() {
                     }}
                     src={currentTrackUrl ?? undefined}
                     controls={false}
+                    playsInline
                     className="aspect-video w-full rounded-xl bg-black"
                     onEnded={() => advanceTrack()}
                     onCanPlay={() => attemptPlay()}

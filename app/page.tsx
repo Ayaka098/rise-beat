@@ -201,8 +201,11 @@ export default function Home() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [missingObjectUrl, setMissingObjectUrl] = useState(false);
   const [userInteracted, setUserInteracted] = useState(false);
+  const [mediaSurface, setMediaSurface] = useState<MediaKind>("video");
   const sessionUrls = useRef(new Map<string, string>());
   const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
+  const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const alarmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const processedDurations = useRef(new Set<string>());
   const [progressSnapshot, setProgressSnapshot] = useState({ remaining: 0, percent: 0 });
@@ -211,6 +214,7 @@ export default function Home() {
     return /iP(hone|ad|od)/i.test(window.navigator.userAgent);
   }, []);
   const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -274,6 +278,7 @@ export default function Home() {
     };
   }, []);
 
+
   const detachAlarmTimeout = useCallback(() => {
     if (alarmTimeoutRef.current) {
       clearTimeout(alarmTimeoutRef.current);
@@ -335,6 +340,41 @@ export default function Home() {
     return mediaFiles.find((file) => file.id === mediaId) ?? null;
   }, [playbackPlaylistId, playlists, currentTrackIndex, mediaFiles]);
 
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (currentTrack?.kind) {
+      setMediaSurface(currentTrack.kind);
+    }
+  }, [currentTrack?.kind]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const activeMediaSurface = currentTrack?.kind ?? mediaSurface;
+
+  const handleVideoElement = useCallback(
+    (element: HTMLVideoElement | null) => {
+      videoElementRef.current = element;
+      if (activeMediaSurface === "video") {
+        mediaElementRef.current = element;
+      }
+    },
+    [activeMediaSurface],
+  );
+
+  const handleAudioElement = useCallback(
+    (element: HTMLAudioElement | null) => {
+      audioElementRef.current = element;
+      if (activeMediaSurface === "audio") {
+        mediaElementRef.current = element;
+      }
+    },
+    [activeMediaSurface],
+  );
+
+  useEffect(() => {
+    mediaElementRef.current =
+      activeMediaSurface === "video" ? videoElementRef.current : audioElementRef.current;
+  }, [activeMediaSurface]);
+
   const startPlayback = useCallback(
     (playlistId: string, fromAlarm = false) => {
       const playlist = playlists.find((p) => p.id === playlistId);
@@ -345,6 +385,13 @@ export default function Home() {
         return;
       }
       const requiresManualStart = fromAlarm && isiOS && !userInteracted;
+      const firstFileId = playlist.fileIds[0];
+      if (firstFileId) {
+        const firstFile = mediaFiles.find((file) => file.id === firstFileId);
+        if (firstFile) {
+          setMediaSurface(firstFile.kind);
+        }
+      }
       setPlaybackPlaylistId(playlistId);
       setCurrentTrackIndex(0);
       setIsPlaying(true);
@@ -357,7 +404,7 @@ export default function Home() {
             : "再生を開始しました",
       );
     },
-    [isiOS, playlists, userInteracted],
+    [isiOS, playlists, userInteracted, mediaFiles],
   );
 
   useEffect(() => {
@@ -424,7 +471,8 @@ export default function Home() {
       await element.play();
       setNeedsManualPlay(false);
       setPlaybackMessage("再生中");
-    } catch {
+    } catch (error) {
+      console.error("Failed to start media playback", error);
       setNeedsManualPlay(true);
       setPlaybackMessage("自動再生できません。ボタンで開始してください");
     }
@@ -460,11 +508,21 @@ export default function Home() {
   };
 
   const handleEnterFullscreen = () => {
-    const element = mediaElementRef.current;
-    if (element instanceof HTMLVideoElement && element.requestFullscreen) {
+    const element = videoElementRef.current;
+    if (!element) return;
+    if (element.requestFullscreen) {
       element.requestFullscreen().catch(() => {
         // ignore
       });
+      return;
+    }
+    const webkitEnterFullscreen = (element as HTMLVideoElement & { webkitEnterFullscreen?: () => void }).webkitEnterFullscreen;
+    if (webkitEnterFullscreen) {
+      try {
+        webkitEnterFullscreen.call(element);
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -1036,38 +1094,60 @@ export default function Home() {
                 </button>
               )}
             </div>
-            {currentTrack && (
-              <div className="mt-6 rounded-2xl bg-white/70 p-4 shadow-inner">
-                {currentTrack?.kind === "video" ? (
-                  <video
-                    key={currentTrackUrl ?? currentTrack.id}
-                    ref={(element) => {
-                      mediaElementRef.current = element;
-                    }}
-                    src={currentTrackUrl ?? undefined}
-                    controls={false}
-                    className="aspect-video w-full rounded-xl bg-black"
-                    onEnded={() => advanceTrack()}
-                    onCanPlay={() => attemptPlay()}
-                  />
-                ) : (
-                  <audio
-                    key={currentTrackUrl ?? currentTrack.id}
-                    ref={(element) => {
-                      mediaElementRef.current = element;
-                    }}
-                    src={currentTrackUrl ?? undefined}
-                    onCanPlay={() => attemptPlay()}
-                    onEnded={() => advanceTrack()}
-                    controls={false}
-                    className="w-full"
-                  />
-                )}
-                {missingObjectUrl && (
-                  <p className="mt-2 text-xs text-[#e27fa5]">ファイルが見つからないためスキップしました。</p>
-                )}
-              </div>
-            )}
+            <div className="mt-6 rounded-2xl bg-white/70 p-4 shadow-inner">
+              <video
+                ref={handleVideoElement}
+                src={activeMediaSurface === "video" ? currentTrackUrl ?? undefined : undefined}
+                controls={false}
+                playsInline
+                disablePictureInPicture
+                controlsList="nodownload noremoteplayback"
+                preload="auto"
+                className="aspect-video w-full rounded-xl bg-black transition-all"
+                style={{
+                  opacity: activeMediaSurface === "video" && currentTrackUrl ? 1 : 0,
+                  height: activeMediaSurface === "video" && currentTrackUrl ? undefined : 0,
+                  width: activeMediaSurface === "video" && currentTrackUrl ? "100%" : 0,
+                  pointerEvents: activeMediaSurface === "video" && currentTrackUrl ? "auto" : "none",
+                  overflow: "hidden",
+                }}
+                onEnded={() => advanceTrack()}
+                onCanPlay={() => {
+                  if (activeMediaSurface === "video") {
+                    void attemptPlay();
+                  }
+                }}
+              />
+              <audio
+                ref={handleAudioElement}
+                src={activeMediaSurface === "audio" ? currentTrackUrl ?? undefined : undefined}
+                onCanPlay={() => {
+                  if (activeMediaSurface === "audio") {
+                    void attemptPlay();
+                  }
+                }}
+                onEnded={() => advanceTrack()}
+                controls={false}
+                preload="auto"
+                className="w-full"
+                style={{
+                  width: activeMediaSurface === "audio" && currentTrackUrl ? "100%" : 0,
+                  height: activeMediaSurface === "audio" && currentTrackUrl ? undefined : 0,
+                  opacity: activeMediaSurface === "audio" && currentTrackUrl ? 1 : 0,
+                  pointerEvents: activeMediaSurface === "audio" && currentTrackUrl ? "auto" : "none",
+                  overflow: "hidden",
+                }}
+              />
+              {!currentTrack && (
+                <p className="text-xs text-slate-500">再生中のトラックはありません。</p>
+              )}
+              {currentTrack?.kind === "audio" && (
+                <p className="text-xs text-slate-500">音声トラックを再生中です。</p>
+              )}
+              {missingObjectUrl && (
+                <p className="mt-2 text-xs text-[#e27fa5]">ファイルが見つからないためスキップしました。</p>
+              )}
+            </div>
           </div>
         </section>
       </div>

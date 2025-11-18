@@ -411,10 +411,11 @@ export default function Home() {
     detachAlarmTimeout();
     const playlistId = alarm.playlistId;
     if (!alarm.isOn || !alarm.nextTrigger || !playlistId) return;
+    const safePlaylistId: string = playlistId;
     const target = new Date(alarm.nextTrigger).getTime();
     const delay = Math.max(target - Date.now(), 0);
     alarmTimeoutRef.current = setTimeout(() => {
-      startPlayback(playlistId, true);
+      startPlayback(safePlaylistId, true);
       const next = calculateNextTrigger(alarm.time);
       setAlarm((prev) => ({
         ...prev,

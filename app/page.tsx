@@ -463,9 +463,11 @@ export default function Home() {
   const attemptPlay = useCallback(async () => {
     const element = mediaElementRef.current;
     if (!element) return;
-    if (isiOS && !userInteracted) {
+    if (!userInteracted) {
       setNeedsManualPlay(true);
-      setPlaybackMessage("再生を開始するボタンをタップしてください");
+      setPlaybackMessage(
+        isiOS ? "再生を開始するボタンをタップしてください" : "再生を開始するボタンを押してください",
+      );
       return;
     }
     try {

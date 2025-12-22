@@ -16,9 +16,9 @@ export const metadata: Metadata = {
   title: "Rise Beat",
   description: "Rise Beat | お気に入りのプレイリストで目覚めるアラーム",
   icons: {
-    icon: "/icon.png",
-    apple: "/icon.png",
-    shortcut: "/icon.png",
+    icon: "/rise-beat-icon.png?v=2",
+    apple: "/rise-beat-icon.png?v=2",
+    shortcut: "/rise-beat-icon.png?v=2",
   },
 };
 
